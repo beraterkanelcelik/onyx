@@ -167,6 +167,7 @@ const InputBar = memo(
       const {
         ref: inputRef,
         message,
+        isEmpty,
         setContent,
         clearContent,
         handleInput: onInput,
@@ -350,6 +351,7 @@ const InputBar = memo(
                 aria-label={placeholder}
                 aria-multiline={true}
                 data-placeholder={placeholder}
+                data-empty={isEmpty ? "" : undefined}
               />
             </div>
 
