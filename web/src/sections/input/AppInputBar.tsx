@@ -22,6 +22,7 @@ import { useForcedTools } from "@/lib/hooks/useForcedTools";
 import useAppFocus from "@/hooks/useAppFocus";
 import { getPastedFilesIfNoText } from "@/lib/clipboard";
 import { getTextContent } from "@/lib/contentEditable";
+import PasteTilePopover from "@/sections/input/PasteTilePopover";
 import { cn } from "@/lib/utils";
 import { Disabled } from "@opal/core";
 import { useUser } from "@/providers/UserProvider";
@@ -153,8 +154,16 @@ const AppInputBar = React.memo(
       handleInput,
       handleCompositionStart,
       handleCompositionEnd,
-      insertTextAtCursor,
+      pasteText,
+      handleCopy,
+      handleCut,
       setCursorToEnd,
+      handleTileMouseDown,
+      handleTileClick,
+      handleTileKeyDown,
+      tilePopover,
+      dismissTilePopover,
+      updateTileText,
     } = useContentEditable({
       initialContent: initialMessage,
       wrapperRef: inputWrapperRef,
@@ -360,7 +369,8 @@ const AppInputBar = React.memo(
       event.preventDefault();
       const text = event.clipboardData.getData("text/plain");
       if (!text) return;
-      insertTextAtCursor(text);
+
+      pasteText(text);
     }
 
     const handleRemoveMessageFile = useCallback(
@@ -817,6 +827,10 @@ const AppInputBar = React.memo(
                       contentEditable={!disabled}
                       suppressContentEditableWarning
                       onPaste={handlePaste}
+                      onCopy={handleCopy}
+                      onCut={handleCut}
+                      onMouseDown={handleTileMouseDown}
+                      onClick={handleTileClick}
                       onBlur={() => setHighlightedQueueIndex(null)}
                       onKeyDownCapture={handleKeyDownForPromptShortcuts}
                       onInput={handleContentEditableInput}
@@ -842,6 +856,8 @@ const AppInputBar = React.memo(
                       }
                       data-empty={isEmpty ? "" : undefined}
                       onKeyDown={(event) => {
+                        if (handleTileKeyDown(event)) return;
+
                         // Queue navigation mode
                         if (highlightedQueueIndex !== null) {
                           if (event.key === "Enter") {
@@ -1026,6 +1042,15 @@ const AppInputBar = React.memo(
             )}
           </div>
         </Disabled>
+
+        {tilePopover && (
+          <PasteTilePopover
+            text={tilePopover.text}
+            rect={tilePopover.rect}
+            onDismiss={dismissTilePopover}
+            onTextChange={updateTileText}
+          />
+        )}
       </>
     );
   }
