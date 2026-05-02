@@ -27,9 +27,11 @@ export const codeVariant: PreviewVariant = {
   ),
 
   renderFooterLeft: (ctx) => (
-    <Text font="main-ui-body" color="text-03">
-      {`${ctx.lineCount} ${ctx.lineCount === 1 ? "line" : "lines"}`}
-    </Text>
+    <span className="select-none">
+      <Text font="main-ui-body" color="text-03">
+        {`${ctx.lineCount} ${ctx.lineCount === 1 ? "line" : "lines"}`}
+      </Text>
+    </span>
   ),
 
   renderFooterRight: (ctx) => (
