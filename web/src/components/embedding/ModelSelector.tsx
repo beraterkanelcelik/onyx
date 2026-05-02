@@ -214,6 +214,11 @@ export function ModelOption({
               if (!selected) onSelect(model);
             }}
             disabled={selected}
+            aria-label={
+              selected
+                ? `${model.model_name} is selected`
+                : `Select ${model.model_name}`
+            }
           >
             {selected ? "Selected Model" : "Select Model"}
           </button>

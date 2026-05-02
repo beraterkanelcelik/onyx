@@ -224,6 +224,7 @@ export default function SignedUpUserTable({
             className="border border-background-300 bg-neutral p-1 rounded text-sm hover:bg-background-200"
             onClick={() => removeRole(role)}
             style={{ padding: "2px 8px" }}
+            aria-label={`Remove ${USER_ROLE_LABELS[role]} filter`}
           >
             <span>{USER_ROLE_LABELS[role]}</span>
             <span className="ml-3">&times;</span>
