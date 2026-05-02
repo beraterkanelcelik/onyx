@@ -216,8 +216,8 @@ export function ModelOption({
             disabled={selected}
             aria-label={
               selected
-                ? `${model.model_name} is selected`
-                : `Select ${model.model_name}`
+                ? `Selected Model: ${model.model_name}`
+                : `Select Model: ${model.model_name}`
             }
           >
             {selected ? "Selected Model" : "Select Model"}
