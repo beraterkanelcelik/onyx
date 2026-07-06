@@ -10,6 +10,7 @@ import {
   useUsageExport,
   UsageExportUser,
 } from "@/lib/usage/userUsage";
+import { DateRangePickerValue } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
 
 const PAGE_SIZE = 10;
 
@@ -139,14 +140,24 @@ function SortHeader({
   );
 }
 
+interface PerUserUsagePanelProps {
+  timeRange?: DateRangePickerValue;
+}
+
 /**
- * Admin table of per-user token/cost usage for the report window. Search by
- * email and click any column to rank by it (a cost/usage leaderboard); each row
- * has a Reset action that clears the user's current-window usage (lifts a budget
- * block). Filtered + sorted client-side over GET /api/admin/usage/export.
+ * Admin table of per-user token/cost usage over `timeRange` (the page's date
+ * selector; backend default range when absent). Search by email and click any
+ * column to rank by it (a cost/usage leaderboard); each row has a Reset action
+ * that clears the user's current-window usage (lifts a budget block). Filtered
+ * + sorted client-side over GET /api/admin/usage/export.
  */
-export default function PerUserUsagePanel() {
-  const { usage, isLoading, error, refetch } = useUsageExport();
+export default function PerUserUsagePanel({
+  timeRange,
+}: PerUserUsagePanelProps) {
+  const { usage, isLoading, error, refetch } = useUsageExport({
+    from: timeRange?.from,
+    to: timeRange?.to,
+  });
   const [page, setPage] = useState(0);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("cost_cents");
@@ -172,10 +183,11 @@ export default function PerUserUsagePanel() {
 
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
 
-  // Jump back to the first page whenever the filter or sort reshapes the list.
+  // Jump back to the first page whenever the filter, sort, or date range
+  // reshapes the list.
   useEffect(() => {
     setPage(0);
-  }, [query, sortKey, sortDir]);
+  }, [query, sortKey, sortDir, timeRange?.from, timeRange?.to]);
 
   // Clamp the page when the list shrinks (e.g. a reset drops a user off).
   useEffect(() => {
@@ -210,10 +222,11 @@ export default function PerUserUsagePanel() {
       <div className="flex flex-col gap-2">
         <Text font="heading-h3">Per-user usage</Text>
         <Text font="secondary-body" color="text-03">
-          Tokens (input, output, cache reads) and cost per user over the report
-          window. Click a column to rank by it, or search by email. Reset clears
-          a user&apos;s current-window usage to lift a budget block; prior
-          windows are kept.
+          Tokens (input, output, cache reads) and cost per user over the date
+          range selected above (usage accrues in weekly windows; a window
+          counts once it starts inside the range). Click a column to rank by
+          it, or search by email. Reset clears a user&apos;s current-window
+          usage to lift a budget block; prior windows are kept.
         </Text>
 
         <InputTypeIn

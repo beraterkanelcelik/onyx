@@ -3,6 +3,7 @@
 import useSWR from "swr";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import { SWR_KEYS } from "@/lib/swr-keys";
+import { buildApiPath } from "@/lib/urlBuilder";
 
 export interface UsageExportTotals {
   input_tokens: number;
@@ -22,15 +23,35 @@ export interface UsageExportResponse {
   users: UsageExportUser[];
 }
 
+export interface UsageExportRange {
+  from?: Date;
+  to?: Date;
+}
+
+// The export takes `date` params; local calendar date, not toISOString()
+// (which shifts across the UTC boundary for non-UTC users).
+function toDateParam(d: Date): string {
+  const month = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
+
 /**
  * Company-wide per-user usage (admin). GET /api/admin/usage/export.
- * Mutate the returned `refetch` after a reset to revalidate the table.
+ * `range` bounds the report (end-inclusive); omitted bounds fall back to the
+ * backend default (trailing 30 days). Mutate the returned `refetch` after a
+ * reset to revalidate the table.
  */
-export function useUsageExport() {
+export function useUsageExport(range?: UsageExportRange) {
+  const url = buildApiPath(SWR_KEYS.adminUsageExport, {
+    start: range?.from ? toDateParam(range.from) : undefined,
+    end: range?.to ? toDateParam(range.to) : undefined,
+  });
   const { data, error, isLoading, mutate } = useSWR<UsageExportResponse>(
-    SWR_KEYS.adminUsageExport,
+    url,
     errorHandlingFetcher,
-    { revalidateOnFocus: false },
+    // keepPreviousData: a range change swaps in place of unmounting the table.
+    { revalidateOnFocus: false, keepPreviousData: true },
   );
 
   return { usage: data, isLoading, error, refetch: mutate };

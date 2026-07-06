@@ -35,7 +35,7 @@ export default function AnalyticsPage() {
           timeRange={timeRange}
         />
         <Divider />
-        <PerUserUsagePanel />
+        <PerUserUsagePanel timeRange={timeRange} />
         <Divider />
         <UsageReports />
       </SettingsLayouts.Body>
