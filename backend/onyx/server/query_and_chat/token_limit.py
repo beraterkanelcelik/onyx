@@ -1,3 +1,4 @@
+import math
 from collections.abc import Sequence
 from datetime import datetime
 from datetime import timedelta
@@ -18,6 +19,8 @@ from onyx.db.models import TokenRateLimit
 from onyx.db.models import User
 from onyx.db.token_limit import fetch_all_global_token_rate_limits
 from onyx.db.user_usage import get_total_cost_cents_buckets_since
+from onyx.db.user_usage import get_window_start
+from onyx.db.user_usage import USAGE_PERIOD_HOURS
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.utils.logger import setup_logger
@@ -30,8 +33,9 @@ logger = setup_logger()
 # multiplied by this to get the real token count enforced.
 TOKEN_BUDGET_UNIT = 1000
 
-# The cost ledger buckets at this fixed grid; the cost cutoff is relaxed by one
-# grid to capture partially-overlapping buckets (see _worst_triggered_cost_limit).
+# The cost ledger buckets at this fixed grid. Bucket FETCHES over-reach by one
+# grid (a cheap superset); per-limit enforcement then counts only the buckets in
+# the budget's fixed window (see _worst_triggered_cost_limit).
 _LEDGER_GRID = timedelta(seconds=USAGE_LIMIT_WINDOW_SECONDS)
 
 
@@ -179,6 +183,18 @@ def _is_rate_limited(
     return _worst_triggered_limit(rate_limits, usage) is not None
 
 
+def _cost_budget_window(period_hours: int, now: datetime) -> tuple[datetime, datetime]:
+    """The fixed enforcement window (start, end) for a cost budget.
+
+    Cost budgets enforce on the ledger's own fixed grid (weekly budgets snap to
+    Monday 00:00 UTC), so "resets Monday" holds and an admin Reset of the
+    current window truly lifts the block. A period finer than the ledger grid
+    can't see sub-grid spend, so it is clamped up to the grid."""
+    effective_hours = max(period_hours, USAGE_PERIOD_HOURS)
+    start = get_window_start(now, period_hours=effective_hours)
+    return start, start + timedelta(hours=effective_hours)
+
+
 def _worst_triggered_cost_limit(
     rate_limits: Sequence[TokenRateLimit],
     cost_buckets: Sequence[tuple[datetime, float]],
@@ -189,12 +205,13 @@ def _worst_triggered_cost_limit(
 
     Cost comes from the UserUsage ledger (not ChatMessage.token_count), bucketed
     at a coarse fixed grid (_LEDGER_GRID) and fetched once upstream; we sum the
-    buckets per window in Python (no query per limit). A bucket has no sub-grid
-    timing, so to mirror the token sliding window over [now - period_hours, now]
-    we count every bucket that *overlaps* it: window_start >= now - period_hours
-    - grid. This is conservative (a budget period finer than the grid can pull in
-    one adjacent bucket) — fail-CLOSED, the safe direction for a budget gate.
-    Rows without a cost_budget_cents are cost-exempt (token-only).
+    buckets per window in Python (no query per limit). Unlike token limits
+    (sliding over minute-granularity data), cost budgets enforce on FIXED
+    ledger-aligned windows (_cost_budget_window): only buckets starting in the
+    current window count, so a previous window's spend stops counting at
+    rollover — the "weekly allowance resets Monday" semantics the Usage display
+    and admin Reset already follow. Rows without a cost_budget_cents are
+    cost-exempt (token-only).
     """
     now = datetime.now(tz=timezone.utc)
     worst: TokenRateLimit | None = None
@@ -203,9 +220,11 @@ def _worst_triggered_cost_limit(
         if budget is None:
             continue
 
-        cutoff = now - timedelta(hours=rate_limit.period_hours) - _LEDGER_GRID
+        window_start, _ = _cost_budget_window(rate_limit.period_hours, now)
         cost = sum(
-            cents for window_start, cents in cost_buckets if window_start >= cutoff
+            cents
+            for bucket_start, cents in cost_buckets
+            if bucket_start >= window_start
         )
         if cost >= budget:
             if worst is None or rate_limit.period_hours > worst.period_hours:
@@ -214,15 +233,11 @@ def _worst_triggered_cost_limit(
     return worst
 
 
-def raise_rate_limited(scope: str, period_hours: int) -> None:
-    """Raise a structured 429 carrying the offending scope + when its window rolls over.
-
-    Sliding-window enforcement has no single fixed reset instant; we report a full
-    period from now as the conservative "try again after" so the FE banner can count down.
-    """
-    retry_after_seconds = period_hours * 3600
-    reset_at = datetime.now(tz=timezone.utc) + timedelta(seconds=retry_after_seconds)
-    reset_at_iso = reset_at.isoformat()
+def raise_rate_limited(scope: str, reset_at: datetime) -> None:
+    """Raise a structured 429 carrying the offending scope + when it resets."""
+    now = datetime.now(tz=timezone.utc)
+    # ceil: Retry-After must never tell a client to retry before the reset.
+    retry_after_seconds = max(math.ceil((reset_at - now).total_seconds()), 0)
     raise OnyxError(
         OnyxErrorCode.RATE_LIMITED,
         # Neutral wording, no raw timestamp — the FE renders a friendly reset
@@ -230,21 +245,32 @@ def raise_rate_limited(scope: str, period_hours: int) -> None:
         f"You've reached the usage budget for {scope}.",
         extra={
             "scope": scope,
-            "reset_at": reset_at_iso,
+            "reset_at": reset_at.isoformat(),
             "retry_after_seconds": retry_after_seconds,
         },
         headers={"Retry-After": str(retry_after_seconds)},
     )
 
 
-def _raise_for_longest_window(scope: str, *period_hours: int | None) -> None:
-    """Raise once for the longest of the given reset windows (Nones skipped).
+def _raise_for_longest_window(
+    scope: str,
+    token_period_hours: int | None,
+    cost_period_hours: int | None,
+) -> None:
+    """Raise once for the latest of the triggered resets (Nones skipped).
+
     The token and cost gates are independent; evaluating both before raising
-    avoids reporting a too-early reset when a short token window and a long cost
-    window are both exceeded."""
-    periods = [p for p in period_hours if p is not None]
-    if periods:
-        raise_rate_limited(scope, max(periods))
+    avoids reporting a too-early reset when both are exceeded. Token limits
+    slide (no fixed reset instant → a full period from now, conservative);
+    cost budgets are fixed windows (→ the window's actual end)."""
+    now = datetime.now(tz=timezone.utc)
+    resets: list[datetime] = []
+    if token_period_hours is not None:
+        resets.append(now + timedelta(hours=token_period_hours))
+    if cost_period_hours is not None:
+        resets.append(_cost_budget_window(cost_period_hours, now)[1])
+    if resets:
+        raise_rate_limited(scope, max(resets))
 
 
 @lru_cache()

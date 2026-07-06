@@ -130,7 +130,9 @@ def _user_is_rate_limited_by_group(user_id: UUID) -> None:
         group_usage: dict[int, list[tuple[datetime, int]]] = {}
         if _has_token_budget(all_limits):
             token_limits = [
-                rl for rl in all_limits if rl.token_budget is not None and rl.token_budget > 0
+                rl
+                for rl in all_limits
+                if rl.token_budget is not None and rl.token_budget > 0
             ]
             group_cutoff_time = _get_cutoff_time(token_limits)
             group_usage = _fetch_user_group_usage(
@@ -165,9 +167,7 @@ def _user_is_rate_limited_by_group(user_id: UUID) -> None:
             if cost_trig is not None:
                 worst_cost_period = max(worst_cost_period or 0, cost_trig.period_hours)
 
-        _raise_for_longest_window(
-            "your group", worst_token_period, worst_cost_period
-        )
+        _raise_for_longest_window("your group", worst_token_period, worst_cost_period)
 
 
 def _fetch_all_user_group_rate_limits(

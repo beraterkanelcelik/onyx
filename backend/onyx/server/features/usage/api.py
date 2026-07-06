@@ -57,9 +57,18 @@ from shared_configs.configs import USAGE_LIMIT_WINDOW_SECONDS
 # Default trailing range for the export when no start is given.
 _DEFAULT_EXPORT_DAYS = 30
 
-# Cost buckets at this grid; match the gate's cutoff relaxation so the budget the
-# user sees agrees with what enforcement (token_limit._worst_triggered_cost_limit) does.
+# Cost buckets at this grid. Budgets enforce on fixed ledger-aligned windows —
+# mirror token_limit._cost_budget_window so the budget the user sees agrees with
+# what enforcement (token_limit._worst_triggered_cost_limit) does. The grid is
+# only used to over-reach bucket FETCHES (a cheap superset).
 _LEDGER_GRID = timedelta(seconds=USAGE_LIMIT_WINDOW_SECONDS)
+
+
+def _cost_budget_window_start(period_hours: int, now: datetime) -> datetime:
+    """Start of a cost budget's fixed enforcement window (weekly → Monday 00:00
+    UTC). Mirrors token_limit._cost_budget_window; periods finer than the ledger
+    grid clamp up to it."""
+    return get_window_start(now, period_hours=max(period_hours, USAGE_PERIOD_HOURS))
 
 
 def _user_cost_budget(
@@ -78,7 +87,7 @@ def _user_cost_budget(
             candidates.append((budget - used, budget, period_hours))
 
     for rl in fetch_all_user_token_rate_limits(db_session, enabled_only=True):
-        cutoff = now - timedelta(hours=rl.period_hours) - _LEDGER_GRID
+        cutoff = _cost_budget_window_start(rl.period_hours, now)
         _add(
             rl.cost_budget_cents,
             get_user_cost_cents_since(db_session, user_id, cutoff),
@@ -86,7 +95,7 @@ def _user_cost_budget(
         )
 
     for rl in fetch_all_global_token_rate_limits(db_session, enabled_only=True):
-        cutoff = now - timedelta(hours=rl.period_hours) - _LEDGER_GRID
+        cutoff = _cost_budget_window_start(rl.period_hours, now)
         _add(
             rl.cost_budget_cents,
             get_total_cost_cents_since(db_session, cutoff),
@@ -140,7 +149,7 @@ def _group_cost_budget_candidate(
         for rl in limits:
             if rl.cost_budget_cents is None:
                 continue
-            cutoff = now - timedelta(hours=rl.period_hours) - _LEDGER_GRID
+            cutoff = _cost_budget_window_start(rl.period_hours, now)
             used = sum(c for ws, c in group_buckets if ws >= cutoff)
             remaining = rl.cost_budget_cents - used
             if group_binding is None or remaining < group_binding[0]:

@@ -145,37 +145,70 @@ def _assert_structured_429(exc: OnyxError, scope: str, period_hours: int) -> Non
 
     extra = exc.extra or {}
     assert extra["scope"] == scope
-    assert extra["retry_after_seconds"] == period_hours * 3600
+
+    retry_after = cast(int, extra["retry_after_seconds"])
+    # Allow a few seconds of execution slop.
+    assert abs(retry_after - period_hours * 3600) < 60
 
     reset_at = datetime.datetime.fromisoformat(cast(str, extra["reset_at"]))
     now = datetime.datetime.now(tz=datetime.timezone.utc)
     expected = now + datetime.timedelta(hours=period_hours)
-    # Allow a few seconds of execution slop.
     assert abs((reset_at - expected).total_seconds()) < 60
 
-    assert exc.headers == {"Retry-After": str(period_hours * 3600)}
+    assert exc.headers == {"Retry-After": str(retry_after)}
+
+
+def _cost_reset_at(period_hours: int) -> datetime.datetime:
+    """Expected reset for a cost budget: the end of its fixed enforcement window."""
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    return token_limit._cost_budget_window(period_hours, now)[1]
+
+
+def _assert_structured_429_resets_at(
+    exc: OnyxError, scope: str, expected_reset: datetime.datetime
+) -> None:
+    """Cost-budget 429s report the fixed window's actual end, not now + period."""
+    assert exc.error_code is OnyxErrorCode.RATE_LIMITED
+    assert exc.status_code == 429
+    assert scope in exc.detail
+
+    extra = exc.extra or {}
+    assert extra["scope"] == scope
+
+    reset_at = datetime.datetime.fromisoformat(cast(str, extra["reset_at"]))
+    assert abs((reset_at - expected_reset).total_seconds()) < 60
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    retry_after = cast(int, extra["retry_after_seconds"])
+    assert abs(retry_after - (expected_reset - now).total_seconds()) < 60
+    assert exc.headers == {"Retry-After": str(retry_after)}
 
 
 class TestRaiseRateLimited:
     def test_global_scope_shape(self) -> None:
+        reset_at = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(
+            hours=2
+        )
         with pytest.raises(OnyxError) as ei:
-            token_limit.raise_rate_limited("organization", period_hours=2)
+            token_limit.raise_rate_limited("organization", reset_at)
         _assert_structured_429(ei.value, "organization", 2)
 
 
 class TestRaiseForLongestWindow:
     """Token + cost gates are evaluated together; the reported reset is the
-    longest window, so a short token limit can't mask a longer cost reset."""
+    latest, so a short token limit can't mask a longer cost reset. Token limits
+    slide (a full period from now); cost budgets reset at their window end."""
 
-    def test_longest_of_token_and_cost_wins(self) -> None:
+    def test_latest_of_token_and_cost_wins(self) -> None:
+        # A 30-day token window resets later than any weekly-clamped cost window.
         with pytest.raises(OnyxError) as ei:
-            token_limit._raise_for_longest_window("user", 1, 24)
-        _assert_structured_429(ei.value, "user", 24)
+            token_limit._raise_for_longest_window("user", 720, 24)
+        _assert_structured_429(ei.value, "user", 720)
 
-    def test_skips_none_windows(self) -> None:
+    def test_cost_reset_is_window_end(self) -> None:
         with pytest.raises(OnyxError) as ei:
             token_limit._raise_for_longest_window("user", None, 5)
-        _assert_structured_429(ei.value, "user", 5)
+        _assert_structured_429_resets_at(ei.value, "user", _cost_reset_at(5))
 
     def test_no_trigger_does_not_raise(self) -> None:
         token_limit._raise_for_longest_window("user", None, None)  # no raise
@@ -313,7 +346,7 @@ class TestGlobalCostRejectionPath:
 
         with pytest.raises(OnyxError) as ei:
             token_limit._user_is_rate_limited_by_global()
-        _assert_structured_429(ei.value, "organization", 3)
+        _assert_structured_429_resets_at(ei.value, "organization", _cost_reset_at(3))
 
     def test_under_global_cost_does_not_raise(
         self, monkeypatch: pytest.MonkeyPatch
@@ -398,7 +431,8 @@ class TestCostEnforcementRealLedgerPath:
         self, monkeypatch: pytest.MonkeyPatch, ledger_session: Session
     ) -> None:
         # Ledger row written at the weekly grid (as the real processor does),
-        # but the admin's budget period is 24h. The sliding cutoff still reads it.
+        # but the admin's budget period is 24h. Clamped up to the ledger grid,
+        # the current window's bucket still blocks (fail-closed).
         import uuid
 
         now = datetime.datetime.now(tz=datetime.timezone.utc)
@@ -429,7 +463,7 @@ class TestCostEnforcementRealLedgerPath:
 
         with pytest.raises(OnyxError) as ei:
             token_limit._user_is_rate_limited_by_global()
-        _assert_structured_429(ei.value, "organization", 24)
+        _assert_structured_429_resets_at(ei.value, "organization", _cost_reset_at(24))
 
     def test_window_rollover_does_not_count(
         self, monkeypatch: pytest.MonkeyPatch, ledger_session: Session
@@ -438,14 +472,42 @@ class TestCostEnforcementRealLedgerPath:
 
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         current = get_window_start(now, period_hours=168)
-        # Two grids back: always before the (period + one-grid) relaxed cutoff,
-        # regardless of weekday. A 24h budget must not see last-period spend.
+        # Two grids back: always outside the current fixed enforcement window.
+        # A 24h budget must not see last-period spend.
         prior = current - datetime.timedelta(days=14)
         record_user_usage(
             ledger_session, str(uuid.uuid4()), "m", "CHAT", None, 1, 1, 0, 9999.0, prior
         )
 
         limit = _cost_limit(100.0, TokenRateLimitScope.GLOBAL, period_hours=24)
+        monkeypatch.setattr(
+            token_limit,
+            "get_session_with_current_tenant",
+            lambda: _RealLedgerSessionCtx(ledger_session),
+        )
+        monkeypatch.setattr(
+            token_limit, "fetch_all_global_token_rate_limits", lambda **_: [limit]
+        )
+        monkeypatch.setattr(token_limit, "_fetch_global_usage", lambda *_: _usage(1))
+
+        token_limit._user_is_rate_limited_by_global()  # no raise
+
+    def test_previous_window_spend_stops_counting_at_rollover(
+        self, monkeypatch: pytest.MonkeyPatch, ledger_session: Session
+    ) -> None:
+        # Regression (prod 2026-07-06): the old relaxed sliding cutoff
+        # (now - period - grid) kept counting LAST week's bucket all through
+        # this week, so a user who capped in week N stayed blocked for all of
+        # week N+1. Fixed windows must free them at the rollover.
+        import uuid
+
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        prior = get_window_start(now, period_hours=168) - datetime.timedelta(days=7)
+        record_user_usage(
+            ledger_session, str(uuid.uuid4()), "m", "CHAT", None, 1, 1, 0, 9999.0, prior
+        )
+
+        limit = _cost_limit(100.0, TokenRateLimitScope.GLOBAL, period_hours=168)
         monkeypatch.setattr(
             token_limit,
             "get_session_with_current_tenant",
@@ -497,7 +559,7 @@ class TestUserGateEE:
         _stub_user_sources(monkeypatch, [limit], _usage(1), _recent_cost_buckets(600.0))
         with pytest.raises(OnyxError) as ei:
             ee_token_limit._user_is_rate_limited(uuid.uuid4())
-        _assert_structured_429(ei.value, "your account", 2)
+        _assert_structured_429_resets_at(ei.value, "your account", _cost_reset_at(2))
 
     def test_user_under_cost_budget_does_not_raise(
         self, monkeypatch: pytest.MonkeyPatch
@@ -589,7 +651,7 @@ class TestGroupGateEE:
         )
         with pytest.raises(OnyxError) as ei:
             ee_token_limit._user_is_rate_limited_by_group(uuid.uuid4())
-        _assert_structured_429(ei.value, "your group", 4)
+        _assert_structured_429_resets_at(ei.value, "your group", _cost_reset_at(4))
 
     def test_user_allowed_when_one_group_under_budget(
         self, monkeypatch: pytest.MonkeyPatch
@@ -622,7 +684,7 @@ class TestGroupGateEE:
         )
         with pytest.raises(OnyxError) as ei:
             ee_token_limit._user_is_rate_limited_by_group(uuid.uuid4())
-        _assert_structured_429(ei.value, "your group", 6)
+        _assert_structured_429_resets_at(ei.value, "your group", _cost_reset_at(6))
 
 
 class TestUserCostEnforcementRealLedgerPath:
@@ -656,7 +718,7 @@ class TestUserCostEnforcementRealLedgerPath:
         # cost-only path: the token scan must be skipped, so no ChatMessage query.
         with pytest.raises(OnyxError) as ei:
             ee_token_limit._user_is_rate_limited(uid)
-        _assert_structured_429(ei.value, "your account", 24)
+        _assert_structured_429_resets_at(ei.value, "your account", _cost_reset_at(24))
 
     def test_other_users_spend_not_counted(
         self, monkeypatch: pytest.MonkeyPatch, ledger_session: Session
