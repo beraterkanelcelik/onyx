@@ -21,7 +21,7 @@ class TokenRateLimitArgs(BaseModel):
     @model_validator(mode="after")
     def _require_a_budget(self) -> "TokenRateLimitArgs":
         if self.token_budget is None and self.cost_budget_cents is None:
-            raise ValueError("Set a token budget, a cost budget, or both.")
+            raise ValueError("Either token_budget or cost_budget_cents must be set.")
         return self
 
 
