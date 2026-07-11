@@ -533,6 +533,7 @@ def _stub_user_sources(
     limits: list[TokenRateLimit],
     token_usage: list[tuple[datetime.datetime, int]],
     cost_buckets: list[tuple[datetime.datetime, float]],
+    member_group_limits: dict[int, list[TokenRateLimit]] | None = None,
 ) -> None:
     monkeypatch.setattr(
         ee_token_limit, "get_session_with_current_tenant", lambda: _SessionCtx()
@@ -543,6 +544,11 @@ def _stub_user_sources(
     monkeypatch.setattr(ee_token_limit, "_fetch_user_usage", lambda *_: token_usage)
     monkeypatch.setattr(
         ee_token_limit, "get_user_cost_cents_buckets_since", lambda *_: cost_buckets
+    )
+    monkeypatch.setattr(
+        ee_token_limit,
+        "_fetch_all_user_group_rate_limits",
+        lambda *_: member_group_limits or {},
     )
 
 
@@ -611,6 +617,9 @@ class TestUserGateEE:
             "get_user_cost_cents_buckets_since",
             lambda *_: _recent_cost_buckets(100.0),
         )
+        monkeypatch.setattr(
+            ee_token_limit, "_fetch_all_user_group_rate_limits", lambda *_: {}
+        )
         ee_token_limit._user_is_rate_limited(uuid.uuid4())  # no raise, no token query
 
 
@@ -634,6 +643,90 @@ def _stub_group_sources(
         "get_group_cost_cents_buckets_since",
         lambda *_: group_cost_buckets,
     )
+
+
+class TestGroupElevatedUserBudget:
+    """A group cost budget elevates its members' PERSONAL cap (max of own and
+    best same-window group budget). The group's shared pot stays a separate
+    gate — elevation only ever extends the user scope."""
+
+    def test_member_of_richer_group_passes_user_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uuid
+
+        user_limit = _cost_limit(2500.0, TokenRateLimitScope.USER, period_hours=168)
+        rich_group = _cost_limit(
+            10000.0, TokenRateLimitScope.USER_GROUP, period_hours=168
+        )
+        # $30 spent: over the $25 user cap, under the $100 group elevation.
+        _stub_user_sources(
+            monkeypatch,
+            [user_limit],
+            _usage(1),
+            _recent_cost_buckets(3000.0),
+            member_group_limits={1: [rich_group]},
+        )
+        ee_token_limit._user_is_rate_limited(uuid.uuid4())  # no raise
+
+    def test_elevated_budget_still_blocks_when_exceeded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uuid
+
+        user_limit = _cost_limit(2500.0, TokenRateLimitScope.USER, period_hours=168)
+        rich_group = _cost_limit(
+            10000.0, TokenRateLimitScope.USER_GROUP, period_hours=168
+        )
+        _stub_user_sources(
+            monkeypatch,
+            [user_limit],
+            _usage(1),
+            _recent_cost_buckets(10001.0),
+            member_group_limits={1: [rich_group]},
+        )
+        with pytest.raises(OnyxError) as ei:
+            ee_token_limit._user_is_rate_limited(uuid.uuid4())
+        _assert_structured_429_resets_at(ei.value, "your account", _cost_reset_at(168))
+
+    def test_different_window_group_does_not_elevate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uuid
+
+        user_limit = _cost_limit(2500.0, TokenRateLimitScope.USER, period_hours=168)
+        other_window_group = _cost_limit(
+            10000.0, TokenRateLimitScope.USER_GROUP, period_hours=24
+        )
+        _stub_user_sources(
+            monkeypatch,
+            [user_limit],
+            _usage(1),
+            _recent_cost_buckets(3000.0),
+            member_group_limits={1: [other_window_group]},
+        )
+        with pytest.raises(OnyxError):
+            ee_token_limit._user_is_rate_limited(uuid.uuid4())
+
+    def test_poorer_group_never_restricts_user_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import uuid
+
+        user_limit = _cost_limit(2500.0, TokenRateLimitScope.USER, period_hours=168)
+        poor_group = _cost_limit(
+            1000.0, TokenRateLimitScope.USER_GROUP, period_hours=168
+        )
+        # $20: under the $25 user cap; the $10 group must not lower it here
+        # (the group's own shared-pot gate is a separate check).
+        _stub_user_sources(
+            monkeypatch,
+            [user_limit],
+            _usage(1),
+            _recent_cost_buckets(2000.0),
+            member_group_limits={1: [poor_group]},
+        )
+        ee_token_limit._user_is_rate_limited(uuid.uuid4())  # no raise
 
 
 class TestGroupGateEE:
@@ -715,6 +808,9 @@ class TestUserCostEnforcementRealLedgerPath:
         monkeypatch.setattr(
             ee_token_limit, "fetch_all_user_token_rate_limits", lambda **_: [limit]
         )
+        monkeypatch.setattr(
+            ee_token_limit, "_fetch_all_user_group_rate_limits", lambda *_: {}
+        )
         # cost-only path: the token scan must be skipped, so no ChatMessage query.
         with pytest.raises(OnyxError) as ei:
             ee_token_limit._user_is_rate_limited(uid)
@@ -744,6 +840,9 @@ class TestUserCostEnforcementRealLedgerPath:
         )
         monkeypatch.setattr(
             ee_token_limit, "fetch_all_user_token_rate_limits", lambda **_: [limit]
+        )
+        monkeypatch.setattr(
+            ee_token_limit, "_fetch_all_user_group_rate_limits", lambda *_: {}
         )
         ee_token_limit._user_is_rate_limited(me)  # no raise — other user's spend
 

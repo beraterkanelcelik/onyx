@@ -52,6 +52,7 @@ from onyx.server.features.usage.models import UsageExportResponse
 from onyx.server.features.usage.models import UsageExportTotals
 from onyx.server.features.usage.models import UsageExportUser
 from onyx.server.features.usage.models import UserUsageResponse
+from onyx.server.query_and_chat.token_limit import group_elevated_cost_limits
 from shared_configs.configs import USAGE_LIMIT_WINDOW_SECONDS
 
 # Default trailing range for the export when no start is given.
@@ -86,7 +87,18 @@ def _user_cost_budget(
         if budget is not None:
             candidates.append((budget - used, budget, period_hours))
 
-    for rl in fetch_all_user_token_rate_limits(db_session, enabled_only=True):
+    # Mirror the gate: group membership elevates the personal cost cap to the
+    # best same-window group budget (the group's shared pot is a separate
+    # candidate below).
+    user_limits = fetch_all_user_token_rate_limits(db_session, enabled_only=True)
+    member_group_limits = [
+        rl
+        for rls in fetch_user_group_token_rate_limits(
+            db_session, UUID(user_id)
+        ).values()
+        for rl in rls
+    ]
+    for rl in group_elevated_cost_limits(user_limits, member_group_limits):
         cutoff = _cost_budget_window_start(rl.period_hours, now)
         _add(
             rl.cost_budget_cents,

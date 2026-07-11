@@ -30,6 +30,7 @@ from onyx.server.query_and_chat.token_limit import _raise_for_longest_window
 from onyx.server.query_and_chat.token_limit import _user_is_rate_limited_by_global
 from onyx.server.query_and_chat.token_limit import _worst_triggered_cost_limit
 from onyx.server.query_and_chat.token_limit import _worst_triggered_limit
+from onyx.server.query_and_chat.token_limit import group_elevated_cost_limits
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
 
 
@@ -78,13 +79,28 @@ def _user_is_rate_limited(user_id: UUID) -> None:
             token_triggered = _worst_triggered_limit(user_rate_limits, user_usage)
 
         # Cost side — same UserUsage-ledger bucket approach as the global gate.
-        cost_buckets: list[tuple[datetime, float]] = []
+        # Group membership elevates the personal cost cap (max of own budget and
+        # the best same-window group budget); the group's shared pot is enforced
+        # separately by _user_is_rate_limited_by_group.
+        cost_limits = user_rate_limits
         if any(rl.cost_budget_cents is not None for rl in user_rate_limits):
-            cost_cutoff = _get_cutoff_time(user_rate_limits) - _LEDGER_GRID
+            member_group_limits = [
+                rl
+                for rls in _fetch_all_user_group_rate_limits(
+                    user_id, db_session
+                ).values()
+                for rl in rls
+            ]
+            cost_limits = group_elevated_cost_limits(
+                user_rate_limits, member_group_limits
+            )
+        cost_buckets: list[tuple[datetime, float]] = []
+        if any(rl.cost_budget_cents is not None for rl in cost_limits):
+            cost_cutoff = _get_cutoff_time(cost_limits) - _LEDGER_GRID
             cost_buckets = get_user_cost_cents_buckets_since(
                 db_session, str(user_id), cost_cutoff
             )
-        cost_triggered = _worst_triggered_cost_limit(user_rate_limits, cost_buckets)
+        cost_triggered = _worst_triggered_cost_limit(cost_limits, cost_buckets)
 
         _raise_for_longest_window(
             "your account",

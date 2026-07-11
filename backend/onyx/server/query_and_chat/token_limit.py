@@ -183,6 +183,48 @@ def _is_rate_limited(
     return _worst_triggered_limit(rate_limits, usage) is not None
 
 
+def group_elevated_cost_limits(
+    rate_limits: Sequence[TokenRateLimit],
+    group_rate_limits: Sequence[TokenRateLimit],
+) -> list[TokenRateLimit]:
+    """USER-scope limits with cost budgets elevated by group membership.
+
+    A group cost budget grants its members that much personal headroom: each
+    user-scope cost budget becomes max(own, best group budget with the SAME
+    period_hours) — different windows don't mix. Elevation only ever extends.
+    The group's own shared-pot check still applies separately, so a group both
+    grants (here) and bounds (collectively). Returns detached copies; token
+    budgets are untouched.
+    """
+    best_by_period: dict[int, float] = {}
+    for group_rl in group_rate_limits:
+        if group_rl.cost_budget_cents is None or not group_rl.enabled:
+            continue
+        current = best_by_period.get(group_rl.period_hours)
+        if current is None or group_rl.cost_budget_cents > current:
+            best_by_period[group_rl.period_hours] = group_rl.cost_budget_cents
+
+    elevated: list[TokenRateLimit] = []
+    for rl in rate_limits:
+        group_budget = best_by_period.get(rl.period_hours)
+        if (
+            rl.cost_budget_cents is not None
+            and group_budget is not None
+            and group_budget > rl.cost_budget_cents
+        ):
+            copy = TokenRateLimit(
+                enabled=rl.enabled,
+                token_budget=rl.token_budget,
+                period_hours=rl.period_hours,
+                scope=rl.scope,
+            )
+            copy.cost_budget_cents = group_budget
+            elevated.append(copy)
+        else:
+            elevated.append(rl)
+    return elevated
+
+
 def _cost_budget_window(period_hours: int, now: datetime) -> tuple[datetime, datetime]:
     """The fixed enforcement window (start, end) for a cost budget.
 
