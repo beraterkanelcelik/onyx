@@ -5,7 +5,7 @@ import Button from "@/refresh-components/buttons/Button";
 import { Button as OpalButton } from "@opal/components";
 import { cn } from "@opal/utils";
 import { format } from "date-fns";
-import { getXDaysAgo } from "./dateUtils";
+import { getStartOfCurrentWeek, getXDaysAgo } from "./dateUtils";
 import { SvgCalendar } from "@opal/icons";
 export const THIRTY_DAYS = "30d";
 
@@ -38,9 +38,31 @@ export const AdminDateRangeSelector = memo(function AdminDateRangeSelector({
       },
     },
     {
+      label: "Last 7 days",
+      value: {
+        from: getXDaysAgo(7),
+        to: getXDaysAgo(0),
+      },
+    },
+    {
+      label: "This week",
+      value: {
+        from: getStartOfCurrentWeek(),
+        to: getXDaysAgo(0),
+      },
+    },
+    {
       label: "Today",
       value: {
         from: getXDaysAgo(1),
+        to: getXDaysAgo(0),
+      },
+    },
+    {
+      label: "All time",
+      value: {
+        // Predates any deployment, so the range is effectively unbounded.
+        from: new Date(2020, 0, 1),
         to: getXDaysAgo(0),
       },
     },
