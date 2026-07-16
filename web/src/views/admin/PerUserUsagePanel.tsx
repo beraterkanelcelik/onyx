@@ -215,7 +215,10 @@ export default function PerUserUsagePanel({
     );
   }
 
-  const pageUsers = visible.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+  const pageUsers = visible.slice(
+    page * PAGE_SIZE,
+    page * PAGE_SIZE + PAGE_SIZE
+  );
 
   return (
     <Card border="solid" rounding="lg" padding="sm">
@@ -223,10 +226,10 @@ export default function PerUserUsagePanel({
         <Text font="heading-h3">Per-user usage</Text>
         <Text font="secondary-body" color="text-03">
           Tokens (input, output, cache reads) and cost per user over the date
-          range selected above (usage accrues in weekly windows; a window
-          counts once it starts inside the range). Click a column to rank by
-          it, or search by email. Reset clears a user&apos;s current-window
-          usage to lift a budget block; prior windows are kept.
+          range selected above (usage accrues in weekly windows; a window counts
+          once it starts inside the range). Click a column to rank by it, or
+          search by email. Reset clears a user&apos;s current-window usage to
+          lift a budget block; prior windows are kept.
         </Text>
 
         <InputTypeIn

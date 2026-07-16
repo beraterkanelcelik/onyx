@@ -43,7 +43,7 @@ export const TokenRateLimitTable = ({
 
   const handleEnabledChange = (id: number) => {
     const tokenRateLimit = tokenRateLimits.find(
-      (tokenRateLimit) => tokenRateLimit.token_id === id,
+      (tokenRateLimit) => tokenRateLimit.token_id === id
     );
 
     if (!tokenRateLimit) {
@@ -199,7 +199,7 @@ export const GenericTokenRateLimitTable = ({
 }) => {
   const { data, isLoading, error } = useSWR<TokenRateLimitDisplay[]>(
     fetchUrl,
-    errorHandlingFetcher,
+    errorHandlingFetcher
   );
 
   if (isLoading) {

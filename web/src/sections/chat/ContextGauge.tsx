@@ -34,7 +34,7 @@ function ContextGauge({ usage }: ContextGaugeProps) {
   // i.e. the readable inverted color for the dark tooltip surface. Passing a
   // custom <Content> here applied light-background text colors (unreadable).
   const tooltip = `${formatTokens(usage.used_tokens)} / ${formatTokens(
-    usage.max_input_tokens,
+    usage.max_input_tokens
   )} (${pctLabel}%) — older messages are trimmed to fit when the window is full.`;
 
   return (

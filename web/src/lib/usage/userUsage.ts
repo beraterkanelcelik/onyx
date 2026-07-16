@@ -51,7 +51,7 @@ export function useUsageExport(range?: UsageExportRange) {
     url,
     errorHandlingFetcher,
     // keepPreviousData: a range change swaps in place of unmounting the table.
-    { revalidateOnFocus: false, keepPreviousData: true },
+    { revalidateOnFocus: false, keepPreviousData: true }
   );
 
   return { usage: data, isLoading, error, refetch: mutate };

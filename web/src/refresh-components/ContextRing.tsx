@@ -37,13 +37,14 @@ const ContextRing = forwardRef<HTMLDivElement, ContextRingProps>(
         style={{
           background: `conic-gradient(${TONE_FILL[tone]} ${degrees}deg, ${TRACK_COLOR} 0deg)`,
           // Punch out the center so it reads as a ring (donut), not a filled pie.
-          WebkitMask: "radial-gradient(closest-side, transparent 58%, #000 60%)",
+          WebkitMask:
+            "radial-gradient(closest-side, transparent 58%, #000 60%)",
           mask: "radial-gradient(closest-side, transparent 58%, #000 60%)",
         }}
         {...rest}
       />
     );
-  },
+  }
 );
 
 export default ContextRing;
