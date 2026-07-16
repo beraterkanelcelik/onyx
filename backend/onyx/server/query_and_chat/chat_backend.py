@@ -382,9 +382,11 @@ def get_chat_session(
         try:
             context_usage = compute_context_usage(
                 chat_message_details,
-                lambda: get_llm_for_persona(
-                    persona=persona, user=user
-                ).config.max_input_tokens,
+                lambda: (
+                    get_llm_for_persona(
+                        persona=persona, user=user
+                    ).config.max_input_tokens
+                ),
             )
         except Exception:
             logger.exception(
