@@ -17,6 +17,7 @@ from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.models import ChatMessage
 from onyx.db.models import ChatSession
 from onyx.db.models import TokenRateLimit
+from onyx.db.models import TokenRateLimitScope
 from onyx.db.models import User
 from onyx.db.token_limit import fetch_all_global_token_rate_limits
 from onyx.db.user_usage import get_total_cost_cents_buckets_since
@@ -189,14 +190,14 @@ def group_elevated_cost_limits(
     rate_limits: Sequence[TokenRateLimit],
     group_rate_limits: Sequence[TokenRateLimit],
 ) -> list[TokenRateLimit]:
-    """USER-scope limits with cost budgets elevated by group membership.
+    """USER-scope limits with group cost budgets granted per member.
 
-    A group cost budget grants its members that much personal headroom: each
-    user-scope cost budget becomes max(own, best group budget with the SAME
-    period_hours) — different windows don't mix. Elevation only ever extends.
-    The group's own shared-pot check still applies separately, so a group both
-    grants (here) and bounds (collectively). Returns detached copies; token
-    budgets are untouched.
+    A group cost budget grants EACH member that much individual headroom — it
+    is never a shared pool. A user-scope cost budget becomes max(own, best
+    group budget with the SAME period_hours) — different windows don't mix —
+    and a group budget with no same-window user-scope cost limit becomes a
+    cost-only limit of its own. Elevation only ever extends. Returns detached
+    copies; token budgets are untouched.
     """
     best_by_period: dict[int, float] = {}
     for group_rl in group_rate_limits:
@@ -207,8 +208,11 @@ def group_elevated_cost_limits(
             best_by_period[group_rl.period_hours] = group_rl.cost_budget_cents
 
     elevated: list[TokenRateLimit] = []
+    covered_periods: set[int] = set()
     for rl in rate_limits:
         group_budget = best_by_period.get(rl.period_hours)
+        if rl.cost_budget_cents is not None:
+            covered_periods.add(rl.period_hours)
         if (
             rl.cost_budget_cents is not None
             and group_budget is not None
@@ -224,6 +228,20 @@ def group_elevated_cost_limits(
             elevated.append(copy)
         else:
             elevated.append(rl)
+
+    # Group budgets whose window no user-scope cost limit covers still grant
+    # per-member headroom: synthesize a cost-only limit for each such window.
+    for period_hours, group_budget in best_by_period.items():
+        if period_hours in covered_periods:
+            continue
+        copy = TokenRateLimit(
+            enabled=True,
+            token_budget=None,
+            period_hours=period_hours,
+            scope=TokenRateLimitScope.USER_GROUP,
+        )
+        copy.cost_budget_cents = group_budget
+        elevated.append(copy)
     return elevated
 
 

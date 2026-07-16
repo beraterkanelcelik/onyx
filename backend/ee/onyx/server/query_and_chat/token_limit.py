@@ -21,7 +21,6 @@ from onyx.db.models import User
 from onyx.db.models import User__UserGroup
 from onyx.db.models import UserGroup
 from onyx.db.token_limit import fetch_all_user_token_rate_limits
-from onyx.db.user_usage import get_group_cost_cents_buckets_since
 from onyx.db.user_usage import get_user_cost_cents_buckets_since
 from onyx.server.query_and_chat.token_limit import _get_cutoff_time
 from onyx.server.query_and_chat.token_limit import _has_token_budget
@@ -63,7 +62,16 @@ def _user_is_rate_limited(user_id: UUID) -> None:
         user_rate_limits = fetch_all_user_token_rate_limits(
             db_session=db_session, enabled_only=True, ordered=False
         )
-        if not user_rate_limits:
+        # Group cost budgets grant per-member headroom, so they apply through
+        # this gate even when no user-scope limits exist.
+        member_group_limits = [
+            rl
+            for rls in _fetch_all_user_group_rate_limits(user_id, db_session).values()
+            for rl in rls
+        ]
+        if not user_rate_limits and not any(
+            rl.cost_budget_cents is not None for rl in member_group_limits
+        ):
             return
 
         # Token side — skip the usage scan entirely when every limit is cost-only.
@@ -79,21 +87,10 @@ def _user_is_rate_limited(user_id: UUID) -> None:
             token_triggered = _worst_triggered_limit(user_rate_limits, user_usage)
 
         # Cost side — same UserUsage-ledger bucket approach as the global gate.
-        # Group membership elevates the personal cost cap (max of own budget and
-        # the best same-window group budget); the group's shared pot is enforced
-        # separately by _user_is_rate_limited_by_group.
-        cost_limits = user_rate_limits
-        if any(rl.cost_budget_cents is not None for rl in user_rate_limits):
-            member_group_limits = [
-                rl
-                for rls in _fetch_all_user_group_rate_limits(
-                    user_id, db_session
-                ).values()
-                for rl in rls
-            ]
-            cost_limits = group_elevated_cost_limits(
-                user_rate_limits, member_group_limits
-            )
+        # Each member's OWN spend is checked against max(own budget, best
+        # same-window group budget); group budgets are individual grants, never
+        # a shared pool.
+        cost_limits = group_elevated_cost_limits(user_rate_limits, member_group_limits)
         cost_buckets: list[tuple[datetime, float]] = []
         if any(rl.cost_budget_cents is not None for rl in cost_limits):
             cost_cutoff = _get_cutoff_time(cost_limits) - _LEDGER_GRID
@@ -134,6 +131,9 @@ User Group rate limits
 
 
 def _user_is_rate_limited_by_group(user_id: UUID) -> None:
+    """Group TOKEN budgets are enforced here as shared pools. Group COST
+    budgets are per-member grants handled by _user_is_rate_limited — a group's
+    combined spend must never block an individual member."""
     with get_session_with_current_tenant() as db_session:
         group_rate_limits = _fetch_all_user_group_rate_limits(user_id, db_session)
         if not group_rate_limits:
@@ -155,35 +155,18 @@ def _user_is_rate_limited_by_group(user_id: UUID) -> None:
                 user_group_ids, group_cutoff_time, db_session
             )
 
-        # Cost buckets per group — one query for the widest window.
-        group_cost_buckets: dict[int, list[tuple[datetime, float]]] = {}
-        if any(rl.cost_budget_cents is not None for rl in all_limits):
-            cost_cutoff = _get_cutoff_time(all_limits) - _LEDGER_GRID
-            group_cost_buckets = get_group_cost_cents_buckets_since(
-                db_session, user_group_ids, cost_cutoff
-            )
-
-        # A user passes if ANY of their groups is fully under budget (token AND
-        # cost). Only when EVERY group has an exceeded limit do we block, then
-        # report the longest offending window across all groups.
+        # A user passes if ANY of their groups is under its token budget. Only
+        # when EVERY group has an exceeded limit do we block, then report the
+        # longest offending window across all groups.
         worst_token_period: int | None = None
-        worst_cost_period: int | None = None
         for user_group_id, rate_limits in group_rate_limits.items():
             usage = group_usage.get(user_group_id, [])
             token_trig = _worst_triggered_limit(rate_limits, usage)
-            cost_trig = _worst_triggered_cost_limit(
-                rate_limits, group_cost_buckets.get(user_group_id, [])
-            )
-            if token_trig is None and cost_trig is None:
+            if token_trig is None:
                 return  # this group is under budget -> user is allowed
-            if token_trig is not None:
-                worst_token_period = max(
-                    worst_token_period or 0, token_trig.period_hours
-                )
-            if cost_trig is not None:
-                worst_cost_period = max(worst_cost_period or 0, cost_trig.period_hours)
+            worst_token_period = max(worst_token_period or 0, token_trig.period_hours)
 
-        _raise_for_longest_window("your group", worst_token_period, worst_cost_period)
+        _raise_for_longest_window("your group", worst_token_period, None)
 
 
 def _fetch_all_user_group_rate_limits(
