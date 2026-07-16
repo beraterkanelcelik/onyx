@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { toast } from "@/hooks/useToast";
+import { toast } from "@opal/layouts";
 import { PageLoader } from "@/refresh-components/PageLoader";
 import { Button, Card, InputTypeIn, MessageCard, Text } from "@opal/components";
 import { SvgChevronLeft, SvgChevronRight, SvgX } from "@opal/icons";
