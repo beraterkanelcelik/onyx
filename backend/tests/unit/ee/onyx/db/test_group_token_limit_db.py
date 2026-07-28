@@ -68,7 +68,7 @@ def test_group_insert_persists_cost_budget(db_session: Session) -> None:
 def test_group_insert_persists_token_budget(db_session: Session) -> None:
     limit = insert_user_group_token_rate_limit(
         db_session,
-        TokenRateLimitArgs(enabled=True, token_budget=500, period_hours=4),
+        TokenRateLimitArgs(enabled=True, token_budget=500, period_hours=24),
         group_id=1,
     )
     assert limit.token_budget == 500

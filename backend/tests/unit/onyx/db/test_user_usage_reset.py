@@ -22,9 +22,8 @@ from sqlalchemy.orm import sessionmaker
 from onyx.db.models import UserUsage
 from onyx.db.user_usage import get_user_cost_cents_since
 from onyx.db.user_usage import get_window_start
-from onyx.db.user_usage import record_user_usage
 from onyx.db.user_usage import reset_user_usage
-from onyx.db.user_usage import USAGE_PERIOD_HOURS
+from onyx.db.user_usage import USER_USAGE_BUCKET_SECONDS
 
 
 @compiles(PGUUID, "sqlite")
@@ -49,14 +48,27 @@ def db() -> Generator[Session, None, None]:
 
 
 def _record(db: Session, user_id: str, cost: float, window: datetime.datetime) -> None:
-    record_user_usage(db, user_id, "m", "CHAT", None, 1, 1, 0, cost, window)
+    db.add(
+        UserUsage(
+            user_id=user_id,
+            window_start=window,
+            model="m",
+            flow="CHAT",
+            provider="",
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_tokens=0,
+            cost_cents=cost,
+        )
+    )
+    db.commit()
 
 
 class TestResetUserUsage:
     def test_clears_current_window_keeps_history(self, db: Session) -> None:
         uid = str(uuid.uuid4())
         now = datetime.datetime.now(tz=datetime.timezone.utc)
-        current = get_window_start(now, period_hours=USAGE_PERIOD_HOURS)
+        current = get_window_start(now, USER_USAGE_BUCKET_SECONDS)
         prior = current - datetime.timedelta(days=14)
         _record(db, uid, 500.0, current)
         _record(db, uid, 999.0, prior)
@@ -72,7 +84,7 @@ class TestResetUserUsage:
     def test_only_targets_the_given_user(self, db: Session) -> None:
         me, other = str(uuid.uuid4()), str(uuid.uuid4())
         now = datetime.datetime.now(tz=datetime.timezone.utc)
-        current = get_window_start(now, period_hours=USAGE_PERIOD_HOURS)
+        current = get_window_start(now, USER_USAGE_BUCKET_SECONDS)
         _record(db, me, 500.0, current)
         _record(db, other, 500.0, current)
 
