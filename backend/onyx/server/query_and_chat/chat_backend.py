@@ -83,6 +83,7 @@ from onyx.server.query_and_chat.chat_utils import (
     is_spreadsheet_mime_type,
     parse_spreadsheet_for_preview,
 )
+from onyx.server.query_and_chat.context_usage import compute_context_usage
 from onyx.server.query_and_chat.models import (
     ChatFeedbackRequest,
     ChatMessageIdentifier,
@@ -115,6 +116,7 @@ from onyx.server.usage_limits import (
     is_usage_limits_enabled,
 )
 from onyx.server.utils import get_json_line
+from onyx.server.utils import set_current_user_id_dependency
 from onyx.tracing.framework.create import ensure_trace
 from onyx.utils.headers import get_custom_tool_additional_request_headers
 from onyx.utils.logger import setup_logger
@@ -410,6 +412,27 @@ def get_chat_session(
             )
             # msg_packet_list.append(Packet(ind=end_step_nr, obj=OverallStop()))
 
+    # Context-window usage for the gauge — only once a turn has reported a real
+    # prompt size (no gauge on a fresh chat). The LLM is resolved lazily so an
+    # empty chat does no extra work; a provider-resolution failure must not break
+    # session load.
+    context_usage = None
+    if chat_session.persona:
+        persona = chat_session.persona
+        try:
+            context_usage = compute_context_usage(
+                chat_message_details,
+                lambda: (
+                    get_llm_for_persona(
+                        persona=persona, user=user
+                    ).config.max_input_tokens
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to compute context usage for session %s", session_id
+            )
+
     return ChatSessionDetailResponse(
         chat_session_id=session_id,
         description=chat_session.description,
@@ -427,6 +450,7 @@ def get_chat_session(
         # Packets are now directly serialized as Packet Pydantic models
         packets=replay_packet_lists,
         current_run=current_run,
+        context_usage=context_usage,
     )
 
 
@@ -454,11 +478,17 @@ def create_new_chat_session(
     return CreateChatSessionID(chat_session_id=new_chat_session.id)
 
 
+# Shared callable so FastAPI runs auth once across the user + contextvar deps.
+_rename_basic_access = require_permission(Permission.BASIC_ACCESS)
+
+
 @router.put("/rename-chat-session")
 def rename_chat_session(
     rename_req: ChatRenameRequest,
     request: Request,
-    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    user: User = Depends(_rename_basic_access),
+    # Attribute the LLM-generated title to the user (this endpoint can call an LLM).
+    _user_ctx: None = Depends(set_current_user_id_dependency(_rename_basic_access)),
 ) -> RenameChatSessionResponse:
     # 3000 tokens is more than enough for a pair of messages which is enough to provide the required context for generating a
     # good name for the chat session. It's also small enough to fit on even the worst context window LLMs.
@@ -615,6 +645,11 @@ def handle_send_chat_message(
     ),
     _rate_limit_check: None = Depends(check_token_rate_limits),
     _api_key_usage_check: None = Depends(check_api_key_usage),
+    # Pins CURRENT_USER_ID_CONTEXTVAR in the event-loop context so it propagates
+    # into the streaming generator (all branches) for usage attribution.
+    _user_ctx: None = Depends(
+        set_current_user_id_dependency(current_chat_accessible_user)
+    ),
 ) -> StreamingResponse | ChatFullResponse:
     """
     This endpoint is used to send a new chat message.
