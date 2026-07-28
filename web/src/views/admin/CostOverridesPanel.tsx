@@ -2,8 +2,7 @@
 
 import { ChangeEvent, useState } from "react";
 import { useSWRConfig } from "swr";
-import { ContentAction, toast } from "@opal/layouts";
-import { PageLoader } from "@/refresh-components/PageLoader";
+import { ContentAction, PageLoader, toast } from "@opal/layouts";
 import {
   Button,
   Card,
