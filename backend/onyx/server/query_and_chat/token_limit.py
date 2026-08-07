@@ -201,6 +201,65 @@ _SCOPE_LABELS: dict[TokenRateLimitScope, str] = {
 }
 
 
+def group_elevated_cost_limits(
+    rate_limits: Sequence[TokenRateLimit],
+    group_rate_limits: Sequence[TokenRateLimit],
+) -> list[TokenRateLimit]:
+    """USER-scope limits with group cost budgets granted per member.
+
+    A group cost budget grants EACH member that much individual headroom — it
+    is never a shared pool. A user-scope cost budget becomes max(own, best
+    group budget with the SAME period_hours) — different windows don't mix —
+    and a group budget with no same-window user-scope cost limit becomes a
+    cost-only limit of its own. Elevation only ever extends. Returns detached
+    copies; token budgets are untouched.
+    """
+    best_by_period: dict[int, float] = {}
+    for group_rl in group_rate_limits:
+        if group_rl.cost_budget_cents is None or not group_rl.enabled:
+            continue
+        current = best_by_period.get(group_rl.period_hours)
+        if current is None or group_rl.cost_budget_cents > current:
+            best_by_period[group_rl.period_hours] = group_rl.cost_budget_cents
+
+    elevated: list[TokenRateLimit] = []
+    covered_periods: set[int] = set()
+    for rl in rate_limits:
+        group_budget = best_by_period.get(rl.period_hours)
+        if rl.cost_budget_cents is not None:
+            covered_periods.add(rl.period_hours)
+        if (
+            rl.cost_budget_cents is not None
+            and group_budget is not None
+            and group_budget > rl.cost_budget_cents
+        ):
+            copy = TokenRateLimit(
+                enabled=rl.enabled,
+                token_budget=rl.token_budget,
+                period_hours=rl.period_hours,
+                scope=rl.scope,
+            )
+            copy.cost_budget_cents = group_budget
+            elevated.append(copy)
+        else:
+            elevated.append(rl)
+
+    # Group budgets whose window no user-scope cost limit covers still grant
+    # per-member headroom: synthesize a cost-only limit for each such window.
+    for period_hours, group_budget in best_by_period.items():
+        if period_hours in covered_periods:
+            continue
+        copy = TokenRateLimit(
+            enabled=True,
+            token_budget=None,
+            period_hours=period_hours,
+            scope=TokenRateLimitScope.USER_GROUP,
+        )
+        copy.cost_budget_cents = group_budget
+        elevated.append(copy)
+    return elevated
+
+
 def raise_rate_limited(scope: TokenRateLimitScope, reset_at: datetime) -> None:
     """Raise a structured 429 with the next relevant budget reset."""
     retry_after_seconds = max(

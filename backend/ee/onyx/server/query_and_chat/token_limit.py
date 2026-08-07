@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from onyx.configs.constants import TokenRateLimitScope
 from onyx.db.api_key import is_api_key_email_address
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.models import User
+from onyx.db.models import TokenRateLimit, User
 from onyx.db.token_limit import (
     fetch_all_user_token_rate_limits,
     fetch_user_group_token_rate_limits,
@@ -14,7 +14,6 @@ from onyx.db.token_limit import (
 from onyx.db.user_usage import (
     TokenUsageBucket,
     get_cost_window_start,
-    get_group_cost_cents_buckets_since,
     get_group_token_buckets_since,
     get_user_cost_cents_buckets_since,
     get_user_token_buckets_since,
@@ -26,6 +25,7 @@ from onyx.server.query_and_chat.token_limit import (
     _raise_for_latest_reset,
     _token_budget_reset,
     _user_is_rate_limited_by_global,
+    group_elevated_cost_limits,
     raise_rate_limited,
 )
 from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
@@ -60,7 +60,20 @@ def _user_is_rate_limited(user_id: UUID) -> None:
         user_rate_limits = fetch_all_user_token_rate_limits(
             db_session=db_session, enabled_only=True, ordered=False
         )
-        if not user_rate_limits:
+        # A group cost budget is a per-member grant, so a user with no
+        # user-scope limits of their own can still be governed by one — the
+        # empty-limits early return must consider the elevated set too.
+        member_group_limits = [
+            limit
+            for limits in _fetch_all_user_group_rate_limits(
+                user_id, db_session
+            ).values()
+            for limit in limits
+        ]
+        elevated_cost_limits = group_elevated_cost_limits(
+            user_rate_limits, member_group_limits
+        )
+        if not user_rate_limits and not elevated_cost_limits:
             return
 
         token_reset: datetime | None = None
@@ -76,7 +89,9 @@ def _user_is_rate_limited(user_id: UUID) -> None:
 
         cost_reset: datetime | None = None
         cost_limits = [
-            limit for limit in user_rate_limits if limit.cost_budget_cents is not None
+            limit
+            for limit in elevated_cost_limits
+            if limit.cost_budget_cents is not None
         ]
         if cost_limits:
             cost_cutoff = get_cost_window_start(
@@ -86,7 +101,7 @@ def _user_is_rate_limited(user_id: UUID) -> None:
             cost_buckets = get_user_cost_cents_buckets_since(
                 db_session, str(user_id), cost_cutoff
             )
-            cost_reset = _cost_budget_reset(user_rate_limits, cost_buckets)
+            cost_reset = _cost_budget_reset(elevated_cost_limits, cost_buckets)
 
         _raise_for_latest_reset(TokenRateLimitScope.USER, token_reset, cost_reset)
 
@@ -97,6 +112,12 @@ def _fetch_user_usage(
     return get_user_token_buckets_since(db_session, str(user_id), cutoff_time)
 
 
+def _fetch_all_user_group_rate_limits(
+    user_id: UUID, db_session: Session
+) -> dict[int, list[TokenRateLimit]]:
+    return fetch_user_group_token_rate_limits(db_session, user_id)
+
+
 """
 User Group rate limits
 """
@@ -104,7 +125,7 @@ User Group rate limits
 
 def _user_is_rate_limited_by_group(user_id: UUID) -> None:
     with get_session_with_current_tenant() as db_session:
-        group_rate_limits = fetch_user_group_token_rate_limits(db_session, user_id)
+        group_rate_limits = _fetch_all_user_group_rate_limits(user_id, db_session)
         if not group_rate_limits:
             return
 
@@ -125,32 +146,18 @@ def _user_is_rate_limited_by_group(user_id: UUID) -> None:
                 user_group_ids, token_cutoff, db_session
             )
 
-        group_cost_usage: dict[int, list[tuple[datetime, float]]] = {}
-        cost_limits = [
-            limit for limit in all_rate_limits if limit.cost_budget_cents is not None
-        ]
-        if cost_limits:
-            cost_cutoff = get_cost_window_start(
-                datetime.now(timezone.utc),
-                max(limit.period_hours for limit in cost_limits),
-            )
-            group_cost_usage = get_group_cost_cents_buckets_since(
-                db_session, user_group_ids, cost_cutoff
-            )
-
+        # Group COST budgets are per-member grants, not a shared pool, so they
+        # are enforced on the user gate via `group_elevated_cost_limits` and
+        # deliberately not aggregated here. Only TOKEN budgets pool per group.
         group_resets: list[datetime] = []
         for user_group_id, rate_limits in group_rate_limits.items():
             token_reset = _token_budget_reset(
                 rate_limits, group_token_usage.get(user_group_id, [])
             )
-            cost_reset = _cost_budget_reset(
-                rate_limits, group_cost_usage.get(user_group_id, [])
-            )
-            # A group the user is under (no exceeded budget) unblocks them entirely.
-            if token_reset is None and cost_reset is None:
+            # A group the user is under (token pool not exceeded) unblocks them.
+            if token_reset is None:
                 return
-            resets = [reset for reset in (token_reset, cost_reset) if reset is not None]
-            group_resets.append(max(resets))
+            group_resets.append(token_reset)
 
         raise_rate_limited(TokenRateLimitScope.USER_GROUP, min(group_resets))
 
