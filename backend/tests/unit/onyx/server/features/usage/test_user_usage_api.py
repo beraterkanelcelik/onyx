@@ -446,3 +446,42 @@ def test_budget_reflects_group_cost_limit(
     )
     assert body["budget_cents"] == pytest.approx(100.0)
     assert body["budget_remaining_cents"] == pytest.approx(98.75)  # 100 - 1.25
+
+
+def test_group_budget_display_ignores_other_members_spend(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group cost budget is a per-member grant, so the displayed headroom
+    depends only on the caller's own spend."""
+    from onyx.db.models import TokenRateLimitScope
+
+    caller = str(uuid4())
+    teammate = str(uuid4())
+    window = _seed_current_window(db_session, caller)  # caller spends 1.25c
+    _seed_usage(
+        db_session, teammate, "gpt-4o", "CHAT", "openai", 900, 900, 0, 90.0, window
+    )
+
+    limit = TokenRateLimit(
+        enabled=True,
+        token_budget=None,
+        cost_budget_cents=100.0,
+        period_hours=168,
+        scope=TokenRateLimitScope.USER_GROUP,
+    )
+    db_session.add(limit)
+    db_session.flush()
+    for member in (caller, teammate):
+        db_session.add(User__UserGroup(user_id=member, user_group_id=1))
+    db_session.add(TokenRateLimit__UserGroup(rate_limit_id=limit.id, user_group_id=1))
+    db_session.commit()
+    monkeypatch.setattr(
+        "onyx.server.features.usage.api.fetch_default_llm_model", lambda _db: None
+    )
+
+    body = (
+        TestClient(_make_app(db_session, _StubUser(caller))).get("/user/usage").json()
+    )
+    assert body["budget_cents"] == pytest.approx(100.0)
+    # Pooled semantics would report 100 - (1.25 + 90.0) = 8.75.
+    assert body["budget_remaining_cents"] == pytest.approx(98.75)

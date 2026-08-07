@@ -26,7 +26,6 @@ from onyx.db.token_limit import (
 )
 from onyx.db.user_usage import (
     get_cost_window_start,
-    get_group_cost_cents_buckets_since,
     get_total_cost_cents_buckets_since,
     get_usage_export,
     get_usage_reset_window_start,
@@ -57,6 +56,7 @@ from onyx.server.features.usage.models import (
     UsageExportUser,
     UserUsageResponse,
 )
+from onyx.server.query_and_chat.token_limit import group_elevated_cost_limits
 from onyx.utils.datetime import get_window_start
 from shared_configs.configs import USAGE_LIMIT_WINDOW_SECONDS
 
@@ -71,7 +71,11 @@ def _used_from_buckets(
 
 
 def _user_cost_budget(db_session: Session, user_id: str) -> EffectiveCostBudget | None:
-    """Effective cost budget (most binding across user/global/group limits)."""
+    """Effective cost budget: most binding across user and global limits.
+
+    Group cost budgets act per member through elevation, never as a shared pool,
+    so they enter as elevated user-scope limits rather than a group candidate.
+    """
     now = datetime.now(tz=timezone.utc)
     candidates: list[EffectiveCostBudget] = []
 
@@ -93,7 +97,15 @@ def _user_cost_budget(db_session: Session, user_id: str) -> EffectiveCostBudget 
             )
 
     user_rls = fetch_all_user_token_rate_limits(db_session, enabled_only=True)
-    user_cost_rls = [rl for rl in user_rls if rl.cost_budget_cents is not None]
+    member_group_rls = [
+        rl
+        for rls in fetch_user_group_token_rate_limits(db_session, UUID(user_id)).values()
+        for rl in rls
+    ]
+    # Mirror the gate: each member's cap is max(own budget, best same-window
+    # group budget), measured against their own spend only.
+    elevated_rls = group_elevated_cost_limits(user_rls, member_group_rls)
+    user_cost_rls = [rl for rl in elevated_rls if rl.cost_budget_cents is not None]
     if user_cost_rls:
         broadest = max(rl.period_hours for rl in user_cost_rls)
         fetch_cutoff = get_cost_window_start(now, broadest)
@@ -112,10 +124,6 @@ def _user_cost_budget(db_session: Session, user_id: str) -> EffectiveCostBudget 
             get_total_cost_cents_buckets_since(db_session, fetch_cutoff),
         )
 
-    group_candidate = _group_cost_budget_candidate(db_session, user_id, now)
-    if group_candidate is not None:
-        candidates.append(group_candidate)
-
     if not candidates:
         return None
     best = min(candidates, key=lambda c: c.remaining_cents)
@@ -124,58 +132,6 @@ def _user_cost_budget(db_session: Session, user_id: str) -> EffectiveCostBudget 
         remaining_cents=max(best.remaining_cents, 0.0),
         period_hours=best.period_hours,
     )
-
-
-def _group_cost_budget_candidate(
-    db_session: Session, user_id: str, now: datetime
-) -> EffectiveCostBudget | None:
-    """Group cost headroom. Gate requires all groups over budget → pick most
-    permissive; cost-exempt group exempts scope."""
-    group_limits = fetch_user_group_token_rate_limits(db_session, UUID(user_id))
-    if not group_limits:
-        return None
-
-    cost_rls = [
-        rl
-        for rls in group_limits.values()
-        for rl in rls
-        if rl.cost_budget_cents is not None
-    ]
-    if not cost_rls:
-        return None
-
-    # One batched query for every group's cost buckets, then window in Python.
-    broadest = max(rl.period_hours for rl in cost_rls)
-    fetch_cutoff = get_cost_window_start(now, broadest)
-    buckets = get_group_cost_cents_buckets_since(
-        db_session, list(group_limits.keys()), fetch_cutoff
-    )
-
-    most_permissive: EffectiveCostBudget | None = None
-    for group_id, limits in group_limits.items():
-        group_buckets = buckets.get(group_id, [])
-        group_binding: EffectiveCostBudget | None = None
-        for rl in limits:
-            if rl.cost_budget_cents is None:
-                continue
-            cutoff = get_cost_window_start(now, rl.period_hours)
-            used = _used_from_buckets(group_buckets, cutoff)
-            remaining = rl.cost_budget_cents - used
-            if group_binding is None or remaining < group_binding.remaining_cents:
-                group_binding = EffectiveCostBudget(
-                    budget_cents=rl.cost_budget_cents,
-                    remaining_cents=remaining,
-                    period_hours=rl.period_hours,
-                )
-        if group_binding is None:
-            return None  # a cost-exempt group exempts the whole group scope
-        if (
-            most_permissive is None
-            or group_binding.remaining_cents > most_permissive.remaining_cents
-        ):
-            most_permissive = group_binding
-
-    return most_permissive
 
 
 router = APIRouter(prefix="/admin/cost-overrides", tags=PUBLIC_API_TAGS)
